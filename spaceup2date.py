@@ -115,7 +115,7 @@ def prepareupdate(key, servers):
     else:
         print("Failed to run a pre-update script.")
         print("Quiting...")
-       sys.exit(-1)
+        sys.exit(-1)
  
     for s in servers.keys():
         print("Updating " + s + "...")
@@ -176,9 +176,12 @@ def list_completed_systems(key, aid):
 def getlastboot(key, sid):
     return client.system.getDetails(key, sid)['last_boot']
  
-def getosastatus(key, p_action):
+def getosastatusbyactionid(key, p_action):
     """Return OSA Dispatcher status of a system based on pending action id number."""
     server_id = client.schedule.listInProgressSystems(key, p_action)[0]['server_id']
+    return client.system.getDetails(key, server_id)['osa_status']
+ 
+def getosastatus(key, server_id):
     return client.system.getDetails(key, server_id)['osa_status']
  
 def postcheck (key, s):
@@ -212,7 +215,7 @@ def postcheck (key, s):
             if (opt.cancel_pending):
                 actions_2kill = []
                 for p_action in pending_actions:
-                    osa_status = getosastatus(key, p_action)
+                    osa_status = getosastatusbyactionid(key, p_action)
                     if osa_status == 'offline' or osa_status == 'unknown':
                         actions_2kill.append(p_action)
  
@@ -230,7 +233,7 @@ def postcheck (key, s):
             s[server].append(0)
             failed += 1
         elif server == list_completed_systems(key, s[server][3]):
-           s[server].append(1)
+            s[server].append(1)
             success += 1
             servers_id.append(s[server][0])
         else:
@@ -332,8 +335,10 @@ if __name__ == '__main__':
  
     for server in servers_input:
         id = client.system.searchByName(key, str(server))
-        if id:
+        if (id) and (getosastatus(key, id)) == 'online':
             servers_to_update[str(server)].append(id[0]['id'])
+        else:
+            print ("OSA service is offline. Server " + str(s) + "will be skipped.")
  
     if opt.yes:
         print ("The following servers will be updated:\n")
