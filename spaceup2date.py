@@ -266,7 +266,7 @@ def postcheck (key, s):
                 print server
                 today = datetime.today()
                 earliest_occurrence = xmlrpclib.DateTime(today)
-                #client.system.scheduleReboot(key, s[server][0], earliest_occurrence)
+                client.system.scheduleReboot(key, s[server][0], earliest_occurrence)
  
         # Waitng 10 minutes till all servers are rebooted
         sleep(60)
