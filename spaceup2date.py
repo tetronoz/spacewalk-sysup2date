@@ -1,3 +1,4 @@
+#!/usr/bin/python
 from datetime import datetime
 from time import sleep
 import re, getpass, sys, xmlrpclib, os
@@ -9,13 +10,17 @@ vmware_config = """#!/bin/bash
                    if [ -x /usr/bin/vmware-config-tools.pl ]; then echo "test -x /usr/bin/vmware-config-tools.pl && /usr/bin/vmware-config-tools.pl -d && /sbin/shutdown -r -t10 now && sed -i '/sed/d' /etc/rc.d/rc.local" >> /etc/rc.d/rc.local; fi"""
  
 nogpg_install = """#!/bin/bash
+                   /usr/bin/yum clean all
                    /usr/sbin/rhn-profile-sync
-                   /bin/rpm -qa --qf "%{siggpg} %{name}\n" | grep "^(none)" | grep -v gpg |awk '{
-                   pkg=pkg" "$2;
-                   } END {
-                   print pkg;
-                   system("/usr/bin/yum --nogpgcheck -y update "pkg"");
-                   }'"""
+                   """
+ 
+get_runningkernel = """#!/bin/bash
+                   /bin/uname -r
+                   """
+ 
+get_lastreboot = """#!/bin/bash
+                 /usr/bin/last reboot | head -n 1 | awk '{print $5" "$6" "$7" "$8}'
+                 """
  
 # Python 2.6 doesn't support argparse
 try:
@@ -53,7 +58,7 @@ def parsecli():
         parser = OptionParser()
         parser.add_option('-f', action='store', dest='csv', help='Path to a CSV file with names of the servers to update.')
         parser.add_option('-y', action='store_true', dest='yes', default=False, help='Auto answers \'yes\' to all questions.')
-        parser.add_option('-c', action='store_true', dest='cancel_pending', default=False, help='Cancel all pending jobs.')
+        #parser.add_option('-c', action='store_true', dest='cancel_pending', default=False, help='Cancel all pending jobs.')
         parser.add_option('-g', action='store', dest='patching_group', help='Patching group to use. Should be one of the following: MSK.PROD1, MSK.PROD2, MSK.UAT1, MSK.UAT2')
         parser.add_option('-o', action='store_true', dest='report', default=False, help='Generate CSV with a report or prints to stdout otherwise.')
         parser.add_option('-r', action='store_true', dest='reboot', default=False, help='Reboot successfully updated systems.')
@@ -76,7 +81,7 @@ def parsecli():
         parser = argparse.ArgumentParser(description='Update Linux servers using Spacewalk API.')
         parser.add_argument('-f', help='Path to a CSV file which contains names of the servers to update.')
         parser.add_argument('-y', action='store_const', dest='yes', const=0, help='Auto answers \'yes\' to all questions.')
-        parser.add_argument('-n', action='store_const', dest='skip_pending', const=0, help='Continue even if there are pending jobs.')
+        #parser.add_argument('-n', action='store_const', dest='skip_pending', const=0, help='Continue even if there are pending jobs.')
         parser.add_argument('-g', action='store', dest='patching_group', help='Patching group to use. Should be one of the following: MSK.PROD1, MSK.PROD2, MSK.UAT1, MSK.UAT2')
         parser.add_argument('-s', help='Space separated list of servers to update.')
         parser.parse_args()
@@ -98,31 +103,42 @@ def connect_to_spacewalk(spacewalk_server, spacewalk_login, spacewalk_password):
 def prepareupdate(key, servers):
     """Update servers"""
     servers_ids = []
+    already_up2date = []
     for s in servers:
         id = servers[s][0]
         pids, pnames = checkforupdates(key, id)
-        if (pids):
+        if (pids) and (pnames):
             servers[s].append(pids)
             servers[s].append(pnames)
             servers_ids.append(id)
+        else:
+            already_up2date.append(s)
+            print "Server " +str(s) + " is up to date."
  
-    today = datetime.today()
-    earliest_occurrence = xmlrpclib.DateTime(today)
-    script_aid = client.system.scheduleScriptRun(key, servers_ids, "root", "root", 300, nogpg_install, earliest_occurrence)
-    if script_aid:
-        print("Executing a pre-update script...")
-        sleep(60)
+    for up2date_server in already_up2date:
+        servers.pop(up2date_server)
+ 
+    if len(servers_ids) > 0:
+        today = datetime.today()
+        earliest_occurrence = xmlrpclib.DateTime(today)
+        script_aid = client.system.scheduleScriptRun(key, servers_ids, "root", "root", 300, nogpg_install, earliest_occurrence)
+        if script_aid:
+            print("Executing a pre-update script...")
+            sleep(60)
+        else:
+            print("Failed to run a pre-update script.")
+            print("Quiting...")
+            sys.exit(-1)
+ 
+        for s in servers.keys():
+            print("Updating " + s + "...")
+            aid = doupdate(key, servers[s])
+            servers[s].append(aid)
+ 
+       postcheck(key, servers)
     else:
-        print("Failed to run a pre-update script.")
-        print("Quiting...")
-        sys.exit(-1)
- 
-    for s in servers.keys():
-        print("Updating " + s + "...")
-        aid = doupdate(key, servers[s])
-        servers[s].append(aid)
- 
-    postcheck(key, servers)
+        print "All systems are up to date."
+        sys.exit(1)
  
 def checkforupdates(key, s):
     """Check for latest updates available."""
@@ -157,7 +173,7 @@ def list_failed_systems(key, aid):
         return False
     else:
         if len(f) > 0:
-            return f[0]['server_name']
+            return f[0]['server_name'].lower().partition(".")[0]
         else:
             return False
  
@@ -169,7 +185,19 @@ def list_completed_systems(key, aid):
         return False
     else:
         if len(s) > 0:
-            return s[0]['server_name']
+            return s[0]['server_name'].lower().partition(".")[0]
+        else:
+            return False
+ 
+def list_pending_systems(key, aid):
+    """"Returns a list of systems that have a specific action in progress. """
+    try:
+        p = client.schedule.listInProgressSystems(key,aid)
+    except xmlrpclib.Fault:
+        return False
+    else:
+        if len(p) > 0:
+            return p[0]['server_name'].lower().partition(".")[0]
         else:
             return False
  
@@ -189,18 +217,22 @@ def postcheck (key, s):
     success = 0
     failed = 0
     pending = 0
-    repeat = 5
+    repeat = 30
     total = len(s)
     servers_id = []
-    pending_timeout = 10
+    pending_timeout = 60
     print ("\nRunning postchecks...\n")
-    print ("Sleeping for " + str(pending_timeout) + " seconds...")
+    #print ("Sleeping for " + str(pending_timeout) + " seconds...")
  
     pending_actions = list_pending(key)
     pending_size = len(pending_actions)
  
     while pending_size > 0 and repeat >= 1:
-        sleep(pending_timeout)
+        if pending_size > 1:
+            print "There are " + str(pending_size) + " jobs pending ..."
+        else:
+            print "There is " + str(pending_size) + " job pending ..."
+       sleep(pending_timeout)
         pending_actions = list_pending(key)
         pending_size = len(pending_actions)
         repeat -= 1
@@ -211,65 +243,60 @@ def postcheck (key, s):
         pending_size = len(pending_actions)
         if pending_size > 0:
             pending_actions = [pending_actions[i]['id'] for i in range(pending_size) if (pending_actions[i]['inProgressSystems']) > 0]
-            print ("There are " + str(len(pending_actions)) + " pending jobs.")
-            if (opt.cancel_pending):
-                actions_2kill = []
-                for p_action in pending_actions:
-                    osa_status = getosastatusbyactionid(key, p_action)
-                    if osa_status == 'offline' or osa_status == 'unknown':
-                        actions_2kill.append(p_action)
- 
-                if len(actions_2kill) > 0:
-                        print ("Canceling pending jobs...")
-                        if (client.schedule.cancelActions(key, actions_2kill)):
-                            print ("Pending jobs have been canceled successfully.")
-                        else:
-                            print ("Failed to cancel pending jobs.")
+            if pending_size > 1:
+                print ("There are " + str(len(pending_actions)) + " pending jobs.")
             else:
-                print ("Continuing...")
+                print ("There is " + str(len(pending_actions)) + " pending job.")
  
     for server in s.keys():
-        if server == list_failed_systems(key, s[server][3]):
+        #print "Checking the server - " + str(server) + ", action id - " + str(s[server][3])
+        if server.lower() == list_failed_systems(key, s[server][3]):
+            #print "Failed action. Server - " + str(server) + ", action id - " + str(s[server][3])
             s[server].append(0)
             failed += 1
-        elif server == list_completed_systems(key, s[server][3]):
+        elif server.lower() == list_completed_systems(key, s[server][3]):
+            #print "Completed action. Server - " + str(server) + ", action id - " + str(s[server][3])
             s[server].append(1)
-            success += 1
+           success += 1
             servers_id.append(s[server][0])
-        else:
+        elif server.lower() == list_pending_systems(key, s[server][3]):
+            #print "Pending action. Server - " + str(server) + ", action id - " + str(s[server][3])
             s[server].append(2)
             pending += 1
  
- 
     print "\nScheduled: .............. %d" % total
     print "Successful: ............. %d" % success
-    print "Pending/Canceled:........ %d " % pending
+    print "Pending.................. %d " % pending
     print "Failed: ................. %d\n" % failed
  
     if opt.reboot:
-        print "Executing a pre-reboot script..."
-        today = datetime.today()
-        earliest_occurrence = xmlrpclib.DateTime(today)
-        script_aid = client.system.scheduleScriptRun(key, servers_id, "root", "root", 300, vmware_config, earliest_occurrence)
-        if script_aid:
-            print("Still executing a pre-reboot script...")
-            size = len(servers_id)
-            while len(client.system.getScriptResults(key, script_aid)) != size:
-                sleep(60)
-        else:
-            print("Failed to run a pre-reboot script.")
-            print ("Quiting...")
-            sys.exit(-1)
-        print "Rebooting updated systems...\n"
-        for server in s.keys():
-            if s[server][4] == 1:
-                print server
-                today = datetime.today()
-                earliest_occurrence = xmlrpclib.DateTime(today)
-                client.system.scheduleReboot(key, s[server][0], earliest_occurrence)
+        if success > 0:
+            print "Executing a pre-reboot script..."
+            today = datetime.today()
+            earliest_occurrence = xmlrpclib.DateTime(today)
+            script_aid = client.system.scheduleScriptRun(key, servers_id, "root", "root", 300, vmware_config, earliest_occurrence)
+            if script_aid:
+                print("Still executing a pre-reboot script...")
+                size = len(servers_id)
+                while len(client.system.getScriptResults(key, script_aid)) != size:
+                    sleep(60)
+            else:
+                print("Failed to run a pre-reboot script.")
+                print ("Quiting...")
+                sys.exit(-1)
+            print "Rebooting updated systems...\n"
+            for server in s.keys():
+                try:
+                    if s[server][4] == 1:
+                        print server
+                        today = datetime.today()
+                        earliest_occurrence = xmlrpclib.DateTime(today)
+                        client.system.scheduleReboot(key, s[server][0], earliest_occurrence)
+                except IndexError:
+                    pass
  
-        # Waitng 10 minutes till all servers are rebooted
-        sleep(60)
+            # Waitng 15 minutes till all servers are rebooted
+            sleep(900)
  
     if opt.report:
         today = datetime.today()
@@ -279,14 +306,23 @@ def postcheck (key, s):
         fp.write('Server Name,Patching status,Last Reboot,Running Kernel,Installed updates\n')
  
         for server in s.keys():
-            reboottime = getlastboot(key, s[server][0])
-            kernel = client.system.getRunningKernel(key, s[server][0])
-            reboottime_pretty = datetime.strptime(str(reboottime), "%Y%m%dT%H:%M:%S").strftime("%d %B %Y %H:%M")
-            s[server].append(reboottime_pretty)
+            # SW doesn't return kernel version and the last reboot time just after system si rebooted.
+            # Will be using a bash script to retrieve this information
+            #kernel = client.system.getRunningKernel(key, s[server][0])
+            #reboottime = getlastboot(key, s[server][0])
+            #reboottime_pretty = datetime.strptime(str(reboottime), "%Y%m%dT%H:%M:%S").strftime("%d %B %Y %H:%M")
+            today = datetime.today()
+            earliest_occurrence = xmlrpclib.DateTime(today)
+            get_running_kernel_aid = client.system.scheduleScriptRun(key, s[server][0], "root", "root", 300, get_runningkernel, earliest_occurrence)
+            get_lastreboot_aid = client.system.scheduleScriptRun(key, s[server][0], "root", "root", 300, get_lastreboot, earliest_occurrence)
+            while list_pending_systems(key, get_running_kernel_aid) or list_pending_systems(key, get_lastreboot_aid):
+                sleep(10)
+            kernel = client.system.getScriptResults(key, get_running_kernel_aid)[0]['output'].rstrip()
+            reboottime = client.system.getScriptResults(key, get_lastreboot_aid)[0]['output'].rstrip()
+            s[server].append(reboottime)
             s[server].append(kernel)
             status = {0: 'Failed', 1: 'Success', 2: 'Pending'}
-            fp.write(server + ',' + str(status[s[server][4]]) + ',' + reboottime_pretty + ',' + kernel + ',' + str(s[server][2]) +'\n')
- 
+            fp.write(server + ',' + str(status[s[server][4]]) + ',' + str(reboottime) + ',' + str(kernel) + ',' + str(s[server][2]) +'\n')
         fp.close()
  
 if __name__ == '__main__':
@@ -294,15 +330,19 @@ if __name__ == '__main__':
  
     if opt.csv and os.path.exists(opt.csv):
         try:
-            data = loadtxt(opt.csv, dtype='string', delimiter=';', skiprows=1, usecols=(1,9))
+            data = loadtxt(opt.csv, dtype='string', delimiter=';', usecols=(0,8))
         except IOError:
             print ("Could not open " + opt.csv)
             sys.exit(-1)
         else:
-            servers_input = data[:,0]
-            patching_groups = data[:,1]
- 
-            servers_input = servers_input[patching_groups == opt.patching_group]
+            try:
+                servers_input = data[:,0]
+                patching_groups = data[:,1]
+                servers_input = servers_input[patching_groups == opt.patching_group]
+            except IndexError:
+                if data.size == 2:
+                    if data[1] == opt.patching_group:
+                        servers_input = data[0:1]
     else:
         servers_input = opt.servers_list
  
@@ -314,9 +354,21 @@ if __name__ == '__main__':
         try:
             fp = open(config, "r")
         except IOError:
-            spacewalk_server = str(raw_input("Enter Server name: "))
-            spacewalk_login = str(raw_input("Username: "))
-            spacewalk_password = getpass.getpass("Password:")
+            try:
+                spacewalk_server = str(raw_input("Enter Server name: "))
+            except KeyboardInterrupt:
+                print ""
+                sys.exit(-1)
+            try:
+                spacewalk_login = str(raw_input("Username: "))
+            except KeyboardInterrupt:
+                print ""
+                sys.exit(-1)
+            try:
+                spacewalk_password = getpass.getpass("Password:")
+            except KeyboardInterrupt:
+                print ""
+                sys.exit(-1)
         else:
             for line in fp.readlines():
                 m = re.search(r'server=(.+)', line, re.I)
@@ -331,14 +383,22 @@ if __name__ == '__main__':
             fp.close()
  
     servers_to_update = defaultdict(list)
-    client, key = connect_to_spacewalk(spacewalk_server, spacewalk_login, spacewalk_password)
+    try:
+        client, key = connect_to_spacewalk(spacewalk_server, spacewalk_login, spacewalk_password)
+    except:
+        print "Username or password is incorrect."
+        sys.exit(-1)
  
     for server in servers_input:
-        id = client.system.searchByName(key, str(server))
-        if (id) and (getosastatus(key, id)) == 'online':
+        # Some servers have been registered with FQDN names.
+        server = server.partition(".")[0]
+        id = client.system.searchByName(key, str(server)+"$|" + str(server) + ".YOUR_FQDN_HERE$")
+        if (id) and (getosastatus(key, id[0]['id'])) == 'online':
+            print id[0]['id']
+            print id[0]['name']
             servers_to_update[str(server)].append(id[0]['id'])
         else:
-            print ("OSA service is offline. Server " + str(s) + "will be skipped.")
+            print ("OSA service is offline. Server " + str(server) + " will be skipped.")
  
     if opt.yes:
         print ("The following servers will be updated:\n")
