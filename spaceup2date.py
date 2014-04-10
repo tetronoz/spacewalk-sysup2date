@@ -10,6 +10,7 @@ vmware_config = """#!/bin/bash
                    if [ -x /usr/bin/vmware-config-tools.pl ]; then echo "test -x /usr/bin/vmware-config-tools.pl && /usr/bin/vmware-config-tools.pl -d && /sbin/shutdown -r -t10 now && sed -i '/sed/d' /etc/rc.d/rc.local" >> /etc/rc.d/rc.local; fi"""
  
 nogpg_install = """#!/bin/bash
+                   /bin/rm -f /etc/yum.repos.d/*
                    /usr/bin/yum clean all
                    /usr/sbin/rhn-profile-sync
                    """
@@ -121,34 +122,51 @@ def prepareupdate(key, servers):
     if len(servers_ids) > 0:
         today = datetime.today()
         earliest_occurrence = xmlrpclib.DateTime(today)
-        script_aid = client.system.scheduleScriptRun(key, servers_ids, "root", "root", 300, nogpg_install, earliest_occurrence)
-        if script_aid:
-            print("Executing a pre-update script...")
-            sleep(60)
-        else:
-            print("Failed to run a pre-update script.")
-            print("Quiting...")
-            sys.exit(-1)
+ 
+        #Workaround for com.redhat.rhn.common.translation.TranslationException: Could not find translator for class redstone.xmlrpc.XmlRpcArray to class java.lang.Integer
+        try:
+            script_aid = client.system.scheduleScriptRun(key, servers_ids, "root", "root", 300, nogpg_install, earliest_occurrence)
+            if script_aid:
+                print("Executing a pre-update script...")
+                sleep(60)
+            else:
+                print("Failed to run a pre-update script.")
+                print("Quiting...")
+                sys.exit(-1)
+        except Exception:
+            for sid in servers_ids:
+                if (client.system.scheduleScriptRun(key, sid, "root", "root", 300, nogpg_install, earliest_occurrence)):
+                    print("Executing a pre-update script...")
+                else:
+                    print"Failed to run a pre-update script for server with id " + str(sid)
+                    print("Quiting...")
+                    sys.exit(-1)
  
         for s in servers.keys():
             print("Updating " + s + "...")
             aid = doupdate(key, servers[s])
             servers[s].append(aid)
  
-       postcheck(key, servers)
+        postcheck(key, servers)
     else:
         print "All systems are up to date."
         sys.exit(1)
  
+ 
+def getdetails(key, s):
+    """Get system details"""
+    return client.system.getDetails(key, s)
+ 
 def checkforupdates(key, s):
     """Check for latest updates available."""
     packages = client.system.listLatestUpgradablePackages(key, s)
+    osrelease = getdetails(key, s)["release"]
     pids = []
     pnames = []
     if packages:
         for p in packages:
-            # Skipping pam upgrade
-            if p['name'] == 'pam':
+            # Skipping pam upgrade for RHEL5
+            if p['name'] == 'pam' and osrelease == "5Server":
                 continue
             pnames.append(p['name'] + "-" + p['to_version'] + "-" + p['to_release'] + "-" + p['to_arch'])
             pids.append(p['to_package_id'])
@@ -232,7 +250,7 @@ def postcheck (key, s):
             print "There are " + str(pending_size) + " jobs pending ..."
         else:
             print "There is " + str(pending_size) + " job pending ..."
-       sleep(pending_timeout)
+        sleep(pending_timeout)
         pending_actions = list_pending(key)
         pending_size = len(pending_actions)
         repeat -= 1
@@ -257,7 +275,7 @@ def postcheck (key, s):
         elif server.lower() == list_completed_systems(key, s[server][3]):
             #print "Completed action. Server - " + str(server) + ", action id - " + str(s[server][3])
             s[server].append(1)
-           success += 1
+            success += 1
             servers_id.append(s[server][0])
         elif server.lower() == list_pending_systems(key, s[server][3]):
             #print "Pending action. Server - " + str(server) + ", action id - " + str(s[server][3])
@@ -274,16 +292,33 @@ def postcheck (key, s):
             print "Executing a pre-reboot script..."
             today = datetime.today()
             earliest_occurrence = xmlrpclib.DateTime(today)
-            script_aid = client.system.scheduleScriptRun(key, servers_id, "root", "root", 300, vmware_config, earliest_occurrence)
-            if script_aid:
-                print("Still executing a pre-reboot script...")
-                size = len(servers_id)
-                while len(client.system.getScriptResults(key, script_aid)) != size:
-                    sleep(60)
-            else:
-                print("Failed to run a pre-reboot script.")
-                print ("Quiting...")
-                sys.exit(-1)
+ 
+            try:
+                script_aid = client.system.scheduleScriptRun(key, servers_ids, "root", "root", 300, vmware_config, earliest_occurrence)
+                if script_aid:
+                    print("Still executing a pre-reboot script...")
+                    size = len(servers_id)
+                    while len(client.system.getScriptResults(key, script_aid)) != size:
+                        sleep(60)
+                else:
+                    print("Failed to run a pre-reboot script.")
+                    print ("Quiting...")
+                    sys.exit(-1)
+ 
+            except Exception:
+                script_aid = []
+                for sid in servers_id:
+                    aid = client.system.scheduleScriptRun(key, sid, "root", "root", 300, vmware_config, earliest_occurrence)
+                    if (aid):
+                        script_aid.append(aid)
+                    else:
+                        print("Failed to run a pre-reboot script.")
+                        print("Quiting...")
+                        sys.exit(-1)
+ 
+                if len(script_aid) == len(servers_id):
+                    print "Pre-reboot script was executed on all servers."
+ 
             print "Rebooting updated systems...\n"
             for server in s.keys():
                 try:
@@ -392,17 +427,17 @@ if __name__ == '__main__':
     for server in servers_input:
         # Some servers have been registered with FQDN names.
         server = server.partition(".")[0]
-        id = client.system.searchByName(key, str(server)+"$|" + str(server) + ".YOUR_FQDN_HERE$")
+        id = client.system.searchByName(key, str(server)+"$|" + str(server) + ".example.com$")
         if (id) and (getosastatus(key, id[0]['id'])) == 'online':
-            print id[0]['id']
-            print id[0]['name']
+            #print id[0]['id']
+            #print id[0]['name']
             servers_to_update[str(server)].append(id[0]['id'])
         else:
             print ("OSA service is offline. Server " + str(server) + " will be skipped.")
  
     if opt.yes:
         print ("The following servers will be updated:\n")
-        print (servers_to_update.keys())
+        #print (servers_to_update.keys())
         prepareupdate(key, servers_to_update)
     else:
         print ("The following server(s) will be updated:\n")
