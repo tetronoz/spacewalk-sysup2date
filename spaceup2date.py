@@ -4,15 +4,40 @@ from time import sleep
 import re, getpass, sys, xmlrpclib, os
 from numpy import loadtxt
 from collections import defaultdict
+import xlsxwriter
  
+#
+# If there is an update to kernel its version will be stored in one of these variables
+#
+ 
+kernel5_ver = ""
+kernel6_ver = ""
  
 vmware_config = """#!/bin/bash
+                   test -d /opt/hp/hpsmh && chmod 750 /opt/hp/hpsmh
                    if [ -x /usr/bin/vmware-config-tools.pl ]; then echo "test -x /usr/bin/vmware-config-tools.pl && /usr/bin/vmware-config-tools.pl -d && /sbin/shutdown -r -t10 now && sed -i '/sed/d' /etc/rc.d/rc.local" >> /etc/rc.d/rc.local; fi"""
  
 nogpg_install = """#!/bin/bash
                    /bin/rm -f /etc/yum.repos.d/*
                    /usr/bin/yum clean all
                    /usr/sbin/rhn-profile-sync
+                   wget -q --no-check-certificate https://spacewalk/pub/RPM-GPG-KEY-MySQL -O /tmp/RPM-GPG-KEY-MySQL
+                   wget -q --no-check-certificate https://spacewalkl/pub/RPM-GPG-KEY-CentALT -O /tmp/RPM-GPG-KEY-CentALT
+                   wget -q --no-check-certificate https://spacewalk/pub/RPM-GPG-KEY-HP -O /tmp/RPM-GPG-KEY-HP
+                   wget -q --no-check-certificate https://spacewalk/pub/RPM-GPG-KEY-HP-2048 -O /tmp/RPM-GPG-KEY-HP-2048
+                   wget -q --no-check-certificate https://spacewalk/pub/RPM-GPG-KEY-Adiscon -O /tmp/RPM-GPG-KEY-Adiscon
+                   wget -q --no-check-certificate https://spacewalk/pub/RPM-GPG-KEY-OEL -O /tmp/RPM-GPG-KEY-OEL
+                   wget -q --no-check-certificate https://spacewalk/pub/RPM-GPG-KEY-EPEL -O /tmp/RPM-GPG-KEY-EPEL
+                   /bin/rpm --import /tmp/RPM-GPG-KEY-MySQL
+                   /bin/rpm --import /tmp/RPM-GPG-KEY-CentALT
+                   /bin/rpm --import /tmp/RPM-GPG-KEY-HP
+                   /bin/rpm --import /tmp/RPM-GPG-KEY-HP-2048
+                   /bin/rpm --import /tmp/RPM-GPG-KEY-Adiscon
+                   /bin/rpm --import /tmp/RPM-GPG-KEY-OEL
+                   /bin/rpm --import /tmp/RPM-GPG-KEY-EPEL
+                   /bin/rpm --import
+                   /bin/rm -f /tmp/RPM-GPG-KEY-MySQL /tmp/RPM-GPG-KEY-CentALT /tmp/RPM-GPG-KEY-HP /tmp/RPM-GPG-KEY-Adiscon /tmp/RPM-GPG-KEY-OEL /tmp/RPM-GPG-KEY-EPEL /tmp/RPM-GPG-KEY-HP-2048
+                   /usr/bin/yum --nogpg -y update scx jdk.x86_64 mysecureshell
                    """
  
 get_runningkernel = """#!/bin/bash
@@ -21,6 +46,10 @@ get_runningkernel = """#!/bin/bash
  
 get_lastreboot = """#!/bin/bash
                  /usr/bin/last reboot | head -n 1 | awk '{print $5" "$6" "$7" "$8}'
+                 """
+ 
+fix_hpsmh_mode = """#!/bin/bash
+                 test -d /opt/hp/hpsmh && chmod 750 /opt/hp/hpsmh
                  """
  
 # Python 2.6 doesn't support argparse
@@ -59,7 +88,6 @@ def parsecli():
         parser = OptionParser()
         parser.add_option('-f', action='store', dest='csv', help='Path to a CSV file with names of the servers to update.')
         parser.add_option('-y', action='store_true', dest='yes', default=False, help='Auto answers \'yes\' to all questions.')
-        #parser.add_option('-c', action='store_true', dest='cancel_pending', default=False, help='Cancel all pending jobs.')
         parser.add_option('-g', action='store', dest='patching_group', help='Patching group to use. Should be one of the following: MSK.PROD1, MSK.PROD2, MSK.UAT1, MSK.UAT2')
         parser.add_option('-o', action='store_true', dest='report', default=False, help='Generate CSV with a report or prints to stdout otherwise.')
         parser.add_option('-r', action='store_true', dest='reboot', default=False, help='Reboot successfully updated systems.')
@@ -82,7 +110,6 @@ def parsecli():
         parser = argparse.ArgumentParser(description='Update Linux servers using Spacewalk API.')
         parser.add_argument('-f', help='Path to a CSV file which contains names of the servers to update.')
         parser.add_argument('-y', action='store_const', dest='yes', const=0, help='Auto answers \'yes\' to all questions.')
-        #parser.add_argument('-n', action='store_const', dest='skip_pending', const=0, help='Continue even if there are pending jobs.')
         parser.add_argument('-g', action='store', dest='patching_group', help='Patching group to use. Should be one of the following: MSK.PROD1, MSK.PROD2, MSK.UAT1, MSK.UAT2')
         parser.add_argument('-s', help='Space separated list of servers to update.')
         parser.parse_args()
@@ -165,6 +192,11 @@ def checkforupdates(key, s):
     pnames = []
     if packages:
         for p in packages:
+            if p['name'] == 'kernel' and osrelease == "5Server":
+                kernel5_ver = p['to_version'] + "-" + p['to_release']
+            elif p['name'] == 'kernel' and osrelease == "6Server":
+                kernel6_ver = p['to_version'] + "-" + p['to_release']
+ 
             # Skipping pam upgrade for RHEL5
             if p['name'] == 'pam' and osrelease == "5Server":
                 continue
@@ -240,7 +272,6 @@ def postcheck (key, s):
     servers_id = []
     pending_timeout = 60
     print ("\nRunning postchecks...\n")
-    #print ("Sleeping for " + str(pending_timeout) + " seconds...")
  
     pending_actions = list_pending(key)
     pending_size = len(pending_actions)
@@ -267,18 +298,14 @@ def postcheck (key, s):
                 print ("There is " + str(len(pending_actions)) + " pending job.")
  
     for server in s.keys():
-        #print "Checking the server - " + str(server) + ", action id - " + str(s[server][3])
         if server.lower() == list_failed_systems(key, s[server][3]):
-            #print "Failed action. Server - " + str(server) + ", action id - " + str(s[server][3])
             s[server].append(0)
             failed += 1
         elif server.lower() == list_completed_systems(key, s[server][3]):
-            #print "Completed action. Server - " + str(server) + ", action id - " + str(s[server][3])
             s[server].append(1)
             success += 1
             servers_id.append(s[server][0])
         elif server.lower() == list_pending_systems(key, s[server][3]):
-            #print "Pending action. Server - " + str(server) + ", action id - " + str(s[server][3])
             s[server].append(2)
             pending += 1
  
@@ -337,12 +364,37 @@ def postcheck (key, s):
         today = datetime.today()
         report_time = xmlrpclib.DateTime(today)
         home_dir = os.path.expanduser('~/')
-        fp = open(str(home_dir) + "patchreport_" + str(report_time) + ".csv", 'w')
-        fp.write('Server Name,Patching status,Last Reboot,Running Kernel,Installed updates\n')
+        first_row = ('Server Name', 'Patching status', 'Last Reboot', 'Running Kernel', 'Installed updates')
+ 
+        workbook = xlsxwriter.Workbook(home_dir + "patchreport_" + str(report_time) + ".xlsx")
+        worksheet = workbook.add_worksheet()
+ 
+        bold = workbook.add_format()
+        bold.set_bold()
+ 
+        wrap = workbook.add_format()
+        wrap.set_text_wrap()
+        wrap.set_align('top')
+ 
+        top = workbook.add_format()
+        top.set_align('top')
+ 
+        kernelcell = workbook.add_format()
+        kernelcell.set_align('top')
+        kernelcell.set_bg_color('red')
+ 
+        worksheet.write_row(0, 0, first_row, bold)
+ 
+        row = 1
+        col = 0
+ 
+        regexp =  r"" + re.escape(kernel5_ver) + r"|" + re.escape(kernel6_ver) + r""
+        k = re.compile(regexp, re.I)
  
         for server in s.keys():
-            # SW doesn't return kernel version and the last reboot time just after system si rebooted.
-            # Will be using a bash script to retrieve this information
+            # SW doesn't return kernel's version and the last reboot time just after a system reboot.
+            # Will be using a bash script to retrieve this information that's why the following lines
+            # have been commented out.
             #kernel = client.system.getRunningKernel(key, s[server][0])
             #reboottime = getlastboot(key, s[server][0])
             #reboottime_pretty = datetime.strptime(str(reboottime), "%Y%m%dT%H:%M:%S").strftime("%d %B %Y %H:%M")
@@ -357,8 +409,22 @@ def postcheck (key, s):
             s[server].append(reboottime)
             s[server].append(kernel)
             status = {0: 'Failed', 1: 'Success', 2: 'Pending'}
-            fp.write(server + ',' + str(status[s[server][4]]) + ',' + str(reboottime) + ',' + str(kernel) + ',' + str(s[server][2]) +'\n')
-        fp.close()
+ 
+            pkgs = ' '.join(s[server][2])
+ 
+            worksheet.write_string(row, col, server, top)
+            worksheet.write_string(row, col+1, status[s[server][4]], top)
+            worksheet.write_string(row, col+2, reboottime, top)
+ 
+            if k.match(kernel):
+                worksheet.write_string(row, col+3, kernel, top)
+            else:
+                worksheet.write_string(row, col+3, kernel, kernelcell)
+ 
+            worksheet.write_string(row, col+4, pkgs, wrap)
+ 
+            row += 1
+        workbook.close()
  
 if __name__ == '__main__':
     opt = parsecli()
@@ -429,15 +495,13 @@ if __name__ == '__main__':
         server = server.partition(".")[0]
         id = client.system.searchByName(key, str(server)+"$|" + str(server) + ".example.com$")
         if (id) and (getosastatus(key, id[0]['id'])) == 'online':
-            #print id[0]['id']
-            #print id[0]['name']
             servers_to_update[str(server)].append(id[0]['id'])
         else:
             print ("OSA service is offline. Server " + str(server) + " will be skipped.")
  
     if opt.yes:
         print ("The following servers will be updated:\n")
-        #print (servers_to_update.keys())
+        print (servers_to_update.keys())
         prepareupdate(key, servers_to_update)
     else:
         print ("The following server(s) will be updated:\n")
